@@ -58,7 +58,6 @@ def spherex_cube(
     """
 
     try:
-
         return make_cube_channel_png(
             ra=ra,
             dec=dec,
@@ -66,7 +65,6 @@ def spherex_cube(
         )
 
     except Exception as exc:
-
         raise HTTPException(
             status_code=502,
             detail=(

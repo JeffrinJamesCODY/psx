@@ -1,8 +1,11 @@
+
 from __future__ import annotations
 
 import base64
 import io
-from functools import lru_cache
+import os
+import threading
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -13,28 +16,37 @@ from astropy_healpix import HEALPix
 from PIL import Image
 
 
-# Official SPHEREx DR1 All-Sky Cube location on IRSA.
+# Official SPHEREx DR1 All-Sky Cube location.
 IRSA_BASE = (
     "https://irsa.ipac.caltech.edu/ibe/data/spherex/dr1/"
     "hips5_cube/hips_20261026/Norder5"
 )
 
-
-# DR1 All-Sky Cube uses HEALPix order 5.
-# Nside = 2^order = 32.
+# HEALPix order 5.
 HPX = HEALPix(
     nside=32,
     order="nested",
     frame="icrs",
 )
 
+# Store downloaded cubes locally rather than in RAM.
+CACHE_DIR = Path(__file__).resolve().parent / "spherex_cache"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+# Prevent simultaneous downloads of the same pixel.
+_locks_guard = threading.Lock()
+_pixel_locks: dict[int, threading.Lock] = {}
+
+
+def _get_pixel_lock(pixel: int) -> threading.Lock:
+    with _locks_guard:
+        if pixel not in _pixel_locks:
+            _pixel_locks[pixel] = threading.Lock()
+
+        return _pixel_locks[pixel]
+
 
 def _normalise_to_uint8(data: np.ndarray) -> np.ndarray:
-    """
-    Convert scientific flfeoating-point image data
-    into an 8-bit image suitable for a browser
-    """
-
     data = np.asarray(data, dtype=np.float32)
 
     finite = np.isfinite(data)
@@ -46,7 +58,6 @@ def _normalise_to_uint8(data: np.ndarray) -> np.ndarray:
 
     values = data[finite]
 
-# Ignore extreme outliers.
     lo, hi = np.percentile(values, [1, 99])
 
     if hi <= lo:
@@ -57,7 +68,6 @@ def _normalise_to_uint8(data: np.ndarray) -> np.ndarray:
 
     scaled = (clipped - lo) / max(hi - lo, 1e-12)
 
- # Asinh stretch makes faint structures easier to see.
     stretched = (
         np.arcsinh(8 * scaled)
         / np.arcsinh(8)
@@ -72,15 +82,7 @@ def _normalise_to_uint8(data: np.ndarray) -> np.ndarray:
     ).astype(np.uint8)
 
 
-def _ra_dec_to_healpix(
-    ra: float,
-    dec: float,
-) -> int:
-    """
-Convert an ICRS RA/Dec position into
-    the SPHEREx HEALPix order-5 pixel
-    """
-
+def _ra_dec_to_healpix(ra: float, dec: float) -> int:
     sky = SkyCoord(
         ra=ra,
         dec=dec,
@@ -88,19 +90,11 @@ Convert an ICRS RA/Dec position into
         frame="icrs",
     )
 
-    pixel = HPX.skycoord_to_healpix(sky)
-
-    return int(pixel)
+    return int(HPX.skycoord_to_healpix(sky))
 
 
 def _cube_url(pixel: int) -> str:
-    """
-    buildef the IRSA FITS URL for a HEALPix pixel
-IRSA stores the pixels in directories based
-    on pixel number.
-    """
-
-    directory = pixel // 10000
+    directory = (pixel // 10000) * 10000
 
     return (
         f"{IRSA_BASE}/Dir{directory}/"
@@ -108,38 +102,110 @@ IRSA stores the pixels in directories based
     )
 
 
-@lru_cache(maxsize=4)
-def _download_cube(pixel: int) -> bytes:
+def _download_cube(pixel: int) -> Path:
     """
-    download a cube from IRSA
-    a small cache prevents repeatedly downloading
-    the same FITS file when the user changes channels
+    Download a cube once and save it to disk.
+    Later requests reuse the saved FITS file.
     """
 
-    url = _cube_url(pixel)
+    cube_path = CACHE_DIR / f"Npix{pixel}_cube.fits"
 
-    response = requests.get(
-        url,
-        timeout=120,
-    )
+    # Only one request per pixel can download at a time.
+    with _get_pixel_lock(pixel):
 
-    response.raise_for_status()
+        if cube_path.exists() and cube_path.stat().st_size > 0:
+            print(
+                f"[SPHEREx] Using disk cache: {cube_path}",
+                flush=True,
+            )
+            return cube_path
 
-    return response.content
+        url = _cube_url(pixel)
+
+        temporary_path = CACHE_DIR / f"Npix{pixel}_cube.part"
+
+        print(
+            f"[SPHEREx] Downloading cube for pixel {pixel}",
+            flush=True,
+        )
+        print(f"[SPHEREx] URL: {url}", flush=True)
+
+        try:
+            downloaded = 0
+
+            with requests.get(
+                url,
+                stream=True,
+                timeout=(20, 300),
+            ) as response:
+
+                response.raise_for_status()
+
+                expected_size = int(
+                    response.headers.get("content-length", 0)
+                )
+
+                print(
+                    f"[SPHEREx] Expected size: "
+                    f"{expected_size / (1024 * 1024):.1f} MB",
+                    flush=True,
+                )
+
+                with open(temporary_path, "wb") as file:
+
+                    for chunk in response.iter_content(
+                        chunk_size=8 * 1024 * 1024
+                    ):
+
+                        if not chunk:
+                            continue
+
+                        file.write(chunk)
+                        downloaded += len(chunk)
+
+                        print(
+                            f"[SPHEREx] Downloaded "
+                            f"{downloaded / (1024 * 1024):.1f} MB",
+                            flush=True,
+                        )
+
+            if downloaded == 0:
+                raise ValueError(
+                    "The SPHEREx server returned an empty cube."
+                )
+
+            if expected_size and downloaded != expected_size:
+                raise ValueError(
+                    f"Incomplete cube download: "
+                    f"{downloaded} of {expected_size} bytes."
+                )
+
+            # Atomic rename: incomplete downloads never become cache files.
+            os.replace(temporary_path, cube_path)
+
+            print(
+                f"[SPHEREx] Cube saved: {cube_path}",
+                flush=True,
+            )
+
+            return cube_path
+
+        except Exception:
+            if temporary_path.exists():
+                temporary_path.unlink()
+
+            raise
 
 
 def _extract_channel(
-    fits_bytes: bytes,
+    cube_path: Path,
     channel: int,
 ) -> tuple[np.ndarray, float]:
-    """
-    Extracts one spectral channel from
-    the SPHEREx 102 channel cube and returns the image data and wavelength
-    """
 
     with fits.open(
-        io.BytesIO(fits_bytes),
-        memmap=False,
+        cube_path,
+        mode="readonly",
+        memmap=True,
     ) as hdul:
 
         if "IMAGE" not in hdul:
@@ -167,15 +233,14 @@ def _extract_channel(
                 f"{number_of_channels - 1}."
             )
 
+        # Copy the selected channel before closing the FITS file.
         channel_image = np.asarray(
             image[channel],
             dtype=np.float32,
-        )
+        ).copy()
 
         wavelength = None
 
-    # Try to obtain the wavelength from the
-        # SPECTRAL_CHANNELS table
         if "SPECTRAL_CHANNELS" in hdul:
 
             table = hdul["SPECTRAL_CHANNELS"].data
@@ -203,8 +268,6 @@ def _extract_channel(
                         table[column_name][channel]
                     )
 
-# If the table has a different structure
-# return the channel number instead
         if wavelength is None:
             wavelength = float(channel)
 
@@ -218,40 +281,43 @@ def make_cube_channel_png(
 ) -> dict[str, Any]:
 
     if not 0 <= ra < 360:
-        raise ValueError(
-            "RA must be between 0 and 360 degrees."
-        )
+        raise ValueError("RA must be between 0 and 360 degrees.")
 
     if not -90 <= dec <= 90:
-        raise ValueError(
-            "Dec must be between -90 and +90 degrees."
-        )
+        raise ValueError("Dec must be between -90 and +90 degrees.")
 
     if not 0 <= channel <= 101:
-        raise ValueError(
-            "SPHEREx channel must be between 0 and 101."
-        )
+        raise ValueError("Channel must be between 0 and 101.")
 
-    pixel = _ra_dec_to_healpix(
-        ra,
-        dec,
+    pixel = _ra_dec_to_healpix(ra, dec)
+
+    print(
+        f"[SPHEREx] RA={ra}, Dec={dec}, "
+        f"Channel={channel}, Pixel={pixel}",
+        flush=True,
     )
 
-    fits_bytes = _download_cube(pixel)
+    # Download once, then reuse the local file for every channel.
+    cube_path = _download_cube(pixel)
+
+    print(
+        f"[SPHEREx] Extracting channel {channel}",
+        flush=True,
+    )
 
     image_data, wavelength = _extract_channel(
-        fits_bytes,
+        cube_path,
         channel,
     )
 
-    image_array = _normalise_to_uint8(
-        image_data
+    print(
+        "[SPHEREx] Channel extracted successfully",
+        flush=True,
     )
 
-    image = Image.fromarray(
-        image_array,
-        mode="L",
-    )
+    image_array = _normalise_to_uint8(image_data)
+
+    image = Image.fromarray(image_array, mode="L")
 
     buffer = io.BytesIO()
 
