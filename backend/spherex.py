@@ -2,169 +2,51 @@ from __future__ import annotations
 
 import base64
 import io
-from datetime import datetime, timezone
+from functools import lru_cache
 from typing import Any
 
 import numpy as np
 import requests
 from astropy.io import fits
-from astropy.time import Time
-from astroquery.ipac.irsa import Irsa
+from astropy.coordinates import SkyCoord
+from astropy_healpix import HEALPix
 from PIL import Image
 
-def _python_value(value: Any):
-    if value is None:
-        return None
-    try:
-        if np.ma.is_masked(value):
-            return None
-    except Exception:
-        pass
 
-    if hasattr(value, "item"):
-        try:
-            return value.item()
-        except Exception:
-            pass
-
-    return value
-
-def _iso_from_mjd(value):
-    if value is None:
-        return None
-    try:
-        return Time(float(value), format="mjd").to_value("isot")
-    except Exception:
-        return str(value)
-
-def _micron(value):
-    if value is None:
-        return None
-    try:
-        return float(value) * 1e6
-    except Exception:
-        return None
-
-def _find_spherex_collection():
-    collections = Irsa.list_collections(servicetype="SIA", filter="spherex")
-    names =[str(row["collection"]) for row in collections]
-
-    preferred = [
-        name for name in names
-        if "dr1" in name.lower()
-    ] + [
-        name for name in names 
-        if "qr3" in name.lower()
-    ]
-
-    if preferred:
-        return preferred[0]
-
-    if names:
-        return names[0]
-    raise RuntimeError("No SPHEREx SIA Collection was returned by IRSA")
-
-SPHEREX_COLLECTIONS = [
-    "spherex_dr1",
-    "spherex_qr3",
-]
+# Official SPHEREx DR1 All-Sky Cube location on IRSA.
+IRSA_BASE = (
+    "https://irsa.ipac.caltech.edu/ibe/data/spherex/dr1/"
+    "hips5_cube/hips_20261026/Norder5"
+)
 
 
-def find_observations(ra: float, dec: float, radius: float, limit: int = 20):
-    observations = []
-    errors = []
-
-    for collection in SPHEREX_COLLECTIONS:
-        try:
-            table = Irsa.query_sia(
-                pos=(ra, dec, radius),
-                collection=collection,
-                maxrec=limit,
-            )
-
-            for row in table:
-                access_url = (
-                    _python_value(row["access_url"])
-                    if "access_url" in table.colnames
-                    else None
-                )
-
-                observations.append({
-                    "id": (
-                        str(_python_value(row["obs_id"]))
-                        if "obs_id" in table.colnames else None
-                    ),
-                    "collection": collection,
-                    "access_url": (
-                        str(access_url)
-                        if access_url and str(access_url).startswith("http")
-                        else None
-                    ),
-                    "product_type": (
-                        str(_python_value(row["dataproduct_type"]))
-                        if "dataproduct_type" in table.colnames else None
-                    ),
-                    "subtype": (
-                        str(_python_value(row["dataproduct_subtype"]))
-                        if "dataproduct_subtype" in table.colnames else None
-                    ),
-                    "instrument": (
-                        str(_python_value(row["instrument_name"]))
-                        if "instrument_name" in table.colnames else None
-                    ),
-                    "observation_time": (
-                        _iso_from_mjd(_python_value(row["t_min"]))
-                        if "t_min" in table.colnames else None
-                    ),
-                    "wavelength_min_um": (
-                        _micron(_python_value(row["em_min"]))
-                        if "em_min" in table.colnames else None
-                    ),
-                    "wavelength_max_um": (
-                        _micron(_python_value(row["em_max"]))
-                        if "em_max" in table.colnames else None
-                    ),
-                })
-
-        except Exception as exc:
-            errors.append(f"{collection}: {exc}")
-
-    if errors and not observations:
-        raise RuntimeError(
-            "All SPHEREx SIA2 collection queries failed: "
-            + " | ".join(errors)
-        )
-
-    return {
-        "query": {
-            "ra": ra,
-            "dec": dec,
-            "radius_deg": radius,
-        },
-        "collections_searched": SPHEREX_COLLECTIONS,
-        "count": min(len(observations), limit),
-        "observations": observations[:limit],
-        "warnings": errors,
-    }
-
-def _build_cutout_url(access_url: str, ra: float, dec: float, size: float) -> str:
-    separator = "&" if "?" in access_url else "?"
-    return (
-        f"{access_url}{separator}"
-        f"center={ra:.8f},{dec:.8f}&size={size:.6f}"
-    )
+# DR1 All-Sky Cube uses HEALPix order 5.
+# Nside = 2^order = 32.
+HPX = HEALPix(
+    nside=32,
+    order="nested",
+    frame="icrs",
+)
 
 
 def _normalise_to_uint8(data: np.ndarray) -> np.ndarray:
+    """
+    Convert scientific flfeoating-point image data
+    into an 8-bit image suitable for a browser
+    """
+
     data = np.asarray(data, dtype=np.float32)
 
     finite = np.isfinite(data)
+
     if not finite.any():
-        raise ValueError("The FITS image contains no finite pixel values.")
+        raise ValueError(
+            "The selected SPHEREx channel contains no valid pixels."
+        )
 
     values = data[finite]
 
-    # Robust display stretch: percentile clipping + asinh.
+# Ignore extreme outliers.
     lo, hi = np.percentile(values, [1, 99])
 
     if hi <= lo:
@@ -172,48 +54,223 @@ def _normalise_to_uint8(data: np.ndarray) -> np.ndarray:
         hi = float(values.max())
 
     clipped = np.clip(data, lo, hi)
+
     scaled = (clipped - lo) / max(hi - lo, 1e-12)
 
-    # Asinh gives faint structures a little more visibility.
-    stretched = np.arcsinh(8 * scaled) / np.arcsinh(8)
+ # Asinh stretch makes faint structures easier to see.
+    stretched = (
+        np.arcsinh(8 * scaled)
+        / np.arcsinh(8)
+    )
+
     stretched[~finite] = 0
 
-    return np.clip(stretched * 255, 0, 255).astype(np.uint8)
+    return np.clip(
+        stretched * 255,
+        0,
+        255,
+    ).astype(np.uint8)
 
 
-def make_cutout_png(access_url: str, ra: float, dec: float, size: float) -> str:
-    if not access_url.startswith("https://irsa.ipac.caltech.edu/ibe/data/spherex/"):
-        raise ValueError(
-            "The selected observation is not an IRSA on-premises SPHEREx image URL."
-        )
+def _ra_dec_to_healpix(
+    ra: float,
+    dec: float,
+) -> int:
+    """
+Convert an ICRS RA/Dec position into
+    the SPHEREx HEALPix order-5 pixel
+    """
 
-    cutout_url = _build_cutout_url(access_url, ra, dec, size)
+    sky = SkyCoord(
+        ra=ra,
+        dec=dec,
+        unit="deg",
+        frame="icrs",
+    )
 
-    response = requests.get(cutout_url, timeout=90)
+    pixel = HPX.skycoord_to_healpix(sky)
+
+    return int(pixel)
+
+
+def _cube_url(pixel: int) -> str:
+    """
+    buildef the IRSA FITS URL for a HEALPix pixel
+IRSA stores the pixels in directories based
+    on pixel number.
+    """
+
+    directory = pixel // 10000
+
+    return (
+        f"{IRSA_BASE}/Dir{directory}/"
+        f"Npix{pixel}_cube.fits"
+    )
+
+
+@lru_cache(maxsize=4)
+def _download_cube(pixel: int) -> bytes:
+    """
+    download a cube from IRSA
+    a small cache prevents repeatedly downloading
+    the same FITS file when the user changes channels
+    """
+
+    url = _cube_url(pixel)
+
+    response = requests.get(
+        url,
+        timeout=120,
+    )
+
     response.raise_for_status()
 
-    with fits.open(io.BytesIO(response.content), memmap=False) as hdul:
-        data = None
+    return response.content
 
-        # Prefer the first 2D science image.
-        for hdu in hdul:
-            if getattr(hdu, "data", None) is not None:
-                arr = np.asarray(hdu.data)
-                if arr.ndim == 2:
-                    data = arr
-                    break
-                if arr.ndim == 3:
-                    data = arr[0]
-                    break
 
-        if data is None:
-            raise ValueError("No 2D image plane was found in the SPHEREx cutout.")
+def _extract_channel(
+    fits_bytes: bytes,
+    channel: int,
+) -> tuple[np.ndarray, float]:
+    """
+    Extracts one spectral channel from
+    the SPHEREx 102 channel cube and returns the image data and wavelength
+    """
 
-        image_array = _normalise_to_uint8(data)
+    with fits.open(
+        io.BytesIO(fits_bytes),
+        memmap=False,
+    ) as hdul:
 
-    image = Image.fromarray(image_array, mode="L")
+        if "IMAGE" not in hdul:
+            raise ValueError(
+                "SPHEREx cube does not contain an IMAGE extension."
+            )
+
+        image = hdul["IMAGE"].data
+
+        if image is None:
+            raise ValueError(
+                "SPHEREx IMAGE extension contains no data."
+            )
+
+        if image.ndim != 3:
+            raise ValueError(
+                f"Unexpected SPHEREx IMAGE dimensions: {image.shape}"
+            )
+
+        number_of_channels = image.shape[0]
+
+        if not 0 <= channel < number_of_channels:
+            raise ValueError(
+                f"Channel must be between 0 and "
+                f"{number_of_channels - 1}."
+            )
+
+        channel_image = np.asarray(
+            image[channel],
+            dtype=np.float32,
+        )
+
+        wavelength = None
+
+    # Try to obtain the wavelength from the
+        # SPECTRAL_CHANNELS table
+        if "SPECTRAL_CHANNELS" in hdul:
+
+            table = hdul["SPECTRAL_CHANNELS"].data
+
+            if table is not None:
+
+                possible_columns = [
+                    "WAVELENGTH",
+                    "WAVELENGTH_CENTER",
+                    "WAVELENGTH_CEN",
+                    "LAMBDA",
+                ]
+
+                column_name = next(
+                    (
+                        name
+                        for name in possible_columns
+                        if name in table.names
+                    ),
+                    None,
+                )
+
+                if column_name is not None:
+                    wavelength = float(
+                        table[column_name][channel]
+                    )
+
+# If the table has a different structure
+# return the channel number instead
+        if wavelength is None:
+            wavelength = float(channel)
+
+        return channel_image, wavelength
+
+
+def make_cube_channel_png(
+    ra: float,
+    dec: float,
+    channel: int = 0,
+) -> dict[str, Any]:
+
+    if not 0 <= ra < 360:
+        raise ValueError(
+            "RA must be between 0 and 360 degrees."
+        )
+
+    if not -90 <= dec <= 90:
+        raise ValueError(
+            "Dec must be between -90 and +90 degrees."
+        )
+
+    if not 0 <= channel <= 101:
+        raise ValueError(
+            "SPHEREx channel must be between 0 and 101."
+        )
+
+    pixel = _ra_dec_to_healpix(
+        ra,
+        dec,
+    )
+
+    fits_bytes = _download_cube(pixel)
+
+    image_data, wavelength = _extract_channel(
+        fits_bytes,
+        channel,
+    )
+
+    image_array = _normalise_to_uint8(
+        image_data
+    )
+
+    image = Image.fromarray(
+        image_array,
+        mode="L",
+    )
 
     buffer = io.BytesIO()
-    image.save(buffer, format="PNG", optimize=True)
 
-    return base64.b64encode(buffer.getvalue()).decode("ascii")
+    image.save(
+        buffer,
+        format="PNG",
+        optimize=True,
+    )
+
+    png = base64.b64encode(
+        buffer.getvalue()
+    ).decode("ascii")
+
+    return {
+        "image": f"data:image/png;base64,{png}",
+        "ra": ra,
+        "dec": dec,
+        "healpix_order": 5,
+        "healpix_pixel": pixel,
+        "channel": channel,
+        "wavelength_um": wavelength,
+    }
