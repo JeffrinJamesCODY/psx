@@ -4,9 +4,9 @@ import { useState } from "react";
 import SkyMap from "../../components/SkyMap";
 import "./explore.css";
 
-const API_BASE =
-  process.env.NEXT_PUBLIC_API_BASE_URL ??
-  "http://localhost:8000";
+const API_BASE = (
+  process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000"
+).replace(/\/+$/, "");
 
 export default function ExplorePage() {
   const [ra, setRa] = useState<number | null>(null);
@@ -51,9 +51,9 @@ export default function ExplorePage() {
         channel: String(selectedChannel),
       });
 
-      const response = await fetch(
-        `${API_BASE}/api/spherex/cube?${params.toString()}`
-      );
+const response = await fetch(
+  `${API_BASE}/api/spherex/cube?ra=${ra}&dec=${dec}&channel=${channel}`
+);
 
       const body = await response.json();
 
